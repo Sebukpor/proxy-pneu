@@ -1,6 +1,5 @@
 /**
- * Pneumonia Screening AI - Proxy Server 
- * For Render.com deployment - Frontend hosted separately on Vercel
+ * Pneumonia Screening AI - Proxy Server (Improved Production Version)
  */
 
 const express = require('express');
@@ -16,7 +15,9 @@ const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 require('dotenv').config();
 
-// Logger Configuration
+// ==========================================================
+// Logger
+// ==========================================================
 const logger = winston.createLogger({
     level: process.env.NODE_ENV === 'production' ? 'info' : 'debug',
     format: winston.format.combine(
@@ -34,312 +35,237 @@ const logger = winston.createLogger({
     ]
 });
 
+// ==========================================================
 // Configuration
+// ==========================================================
 const CONFIG = {
-    PORT: process.env.PORT || 10000,
-    HF_SPACE_URL: process.env.HF_SPACE_URL,
+    PORT: parseInt(process.env.PORT) || 10000,
+    HF_SPACE_URL: (process.env.HF_SPACE_URL || '').replace(/\/$/, ''),
     HF_TOKEN: process.env.HF_TOKEN,
     API_KEY: process.env.API_KEY,
+
     RATE_LIMIT_WINDOW: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
     RATE_LIMIT_MAX: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100,
-    ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : ['*']
+
+    ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS
+        ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim())
+        : ['*'],
+
+    SINGLE_TIMEOUT_MS: parseInt(process.env.SINGLE_TIMEOUT_MS) || 60000,
+    BATCH_TIMEOUT_MS: parseInt(process.env.BATCH_TIMEOUT_MS) || 180000,
+
+    MAX_BATCH_FILES: parseInt(process.env.MAX_BATCH_FILES) || 20,
+    MAX_FILE_SIZE_MB: parseInt(process.env.MAX_FILE_SIZE_MB) || 50
 };
 
-// Validate required environment variables
-if (!CONFIG.HF_SPACE_URL || !CONFIG.HF_TOKEN || !CONFIG.API_KEY) {
-    logger.error('Missing required environment variables:');
-    if (!CONFIG.HF_SPACE_URL) logger.error('  - HF_SPACE_URL');
-    if (!CONFIG.HF_TOKEN) logger.error('  - HF_TOKEN');
-    if (!CONFIG.API_KEY) logger.error('  - API_KEY');
-    process.exit(1);
+// ==========================================================
+// ENV VALIDATION (NO HARD CRASH)
+// ==========================================================
+const missing = ['HF_SPACE_URL', 'HF_TOKEN', 'API_KEY'].filter(k => !CONFIG[k]);
+
+if (missing.length) {
+    logger.error(`❌ Missing ENV variables: ${missing.join(', ')}`);
+    logger.warn("⚠️ Server will still start, but requests will fail.");
 }
 
-// Initialize Express
+// ==========================================================
+// Express App
+// ==========================================================
 const app = express();
 
-// Security Middleware
-app.use(helmet());
+// Security
+app.use(helmet({
+    crossOriginResourcePolicy: { policy: 'cross-origin' }
+}));
 
-// CORS Configuration - IMPORTANT for Vercel frontend
+// CORS
 const corsOptions = {
     origin: (origin, callback) => {
-        // Allow requests with no origin (mobile apps, curl, etc.)
         if (!origin) return callback(null, true);
-        
-        if (CONFIG.ALLOWED_ORIGINS.includes('*') || 
-            CONFIG.ALLOWED_ORIGINS.some(allowed => origin.includes(allowed)) ||
-            origin.includes('vercel.app')) {  // Auto-allow Vercel domains
-            callback(null, true);
-        } else {
-            logger.warn(`CORS blocked origin: ${origin}`);
-            callback(new Error('Not allowed by CORS'));
-        }
+
+        const allowed =
+            CONFIG.ALLOWED_ORIGINS.includes('*') ||
+            CONFIG.ALLOWED_ORIGINS.some(o => origin.includes(o)) ||
+            /\.vercel\.app$/.test(origin) ||
+            /localhost(:\d+)?$/.test(origin);
+
+        if (allowed) callback(null, true);
+        else callback(new Error(`CORS blocked: ${origin}`));
     },
     methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID'],
-    credentials: true,
-    maxAge: 86400
+    exposedHeaders: ['Content-Disposition', 'Content-Length'],
+    credentials: true
 };
 
 app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+
 app.use(compression());
 
-// Rate Limiting
-const limiter = rateLimit({
+// Rate limit
+app.use('/api/', rateLimit({
     windowMs: CONFIG.RATE_LIMIT_WINDOW,
-    max: CONFIG.RATE_LIMIT_MAX,
-    message: {
-        error: 'Too many requests from this IP, please try again later.',
-        retryAfter: Math.ceil(CONFIG.RATE_LIMIT_WINDOW / 1000)
-    },
-    standardHeaders: true,
-    legacyHeaders: false
-});
+    max: CONFIG.RATE_LIMIT_MAX
+}));
 
-app.use('/api/', limiter);
-
-// Body Parsing
+// Body parsing
 app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Multer Configuration
-const storage = multer.memoryStorage();
+// ==========================================================
+// Multer
+// ==========================================================
 const upload = multer({
-    storage: storage,
+    storage: multer.memoryStorage(),
     limits: {
-        fileSize: 50 * 1024 * 1024,
-        files: 20
-    },
-    fileFilter: (req, file, cb) => {
-        const allowedExts = ['.dcm', '.png', '.jpg', '.jpeg'];
-        const ext = path.extname(file.originalname).toLowerCase();
-        
-        if (allowedExts.includes(ext)) {
-            cb(null, true);
-        } else {
-            cb(new Error(`Invalid file type: ${file.originalname}`));
-        }
+        fileSize: CONFIG.MAX_FILE_SIZE_MB * 1024 * 1024,
+        files: CONFIG.MAX_BATCH_FILES
     }
 });
 
-// Request ID Middleware
+// ==========================================================
+// Request Logging
+// ==========================================================
 app.use((req, res, next) => {
     req.id = uuidv4();
-    res.setHeader('X-Request-ID', req.id);
-    next();
-});
-
-// Logging Middleware
-app.use((req, res, next) => {
     const start = Date.now();
+
     res.on('finish', () => {
-        const duration = Date.now() - start;
-        logger.info({
-            requestId: req.id,
-            method: req.method,
-            path: req.path,
-            statusCode: res.statusCode,
-            duration: `${duration}ms`,
-            ip: req.ip,
-            origin: req.headers.origin
-        });
+        logger.info(`${req.method} ${req.path} ${res.statusCode} - ${Date.now() - start}ms`);
     });
+
     next();
 });
 
-// Health Check
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'healthy',
-        timestamp: new Date().toISOString(),
-        version: '1.0.0',
-        uptime: process.uptime()
-    });
-});
+// ==========================================================
+// Helper: Call HF Space with timeout + retry
+// ==========================================================
+async function callHFSpace(path, formData, timeoutMs, retries = 1) {
+    const url = `${CONFIG.HF_SPACE_URL}${path}`;
 
-// Root endpoint
-app.get('/', (req, res) => {
-    res.json({
-        service: 'TB Screening AI Proxy',
-        status: 'running',
-        endpoints: {
-            health: '/health',
-            predict: '/api/predict (POST)',
-            batchPredict: '/api/batch/predict (POST)'
-        },
-        cors: 'Enabled for Vercel frontend'
-    });
-});
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-// Make HF Request helper
-async function makeHFRequest(endpoint, formData, requestId) {
-    const url = `${CONFIG.HF_SPACE_URL}${endpoint}`;
-    
-    const headers = {
-        'Authorization': `Bearer ${CONFIG.HF_TOKEN}`,
-        'X-API-Key': CONFIG.API_KEY,
-        ...formData.getHeaders()
-    };
+        try {
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${CONFIG.HF_TOKEN}`,
+                    'X-API-Key': CONFIG.API_KEY,
+                    ...formData.getHeaders()
+                },
+                body: formData,
+                signal: controller.signal
+            });
 
-    logger.debug(`Making request to ${url}`, { requestId });
+            clearTimeout(timer);
 
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: headers,
-        body: formData
-    });
+            if (response.status === 503 && attempt < retries) {
+                logger.warn("HF cold start, retrying...");
+                continue;
+            }
 
-    return response;
+            return response;
+
+        } catch (err) {
+            clearTimeout(timer);
+
+            if (err.name === 'AbortError') {
+                if (attempt < retries) continue;
+                throw new Error(`Timeout after ${timeoutMs}ms`);
+            }
+
+            throw err;
+        }
+    }
 }
 
+// ==========================================================
+// Routes
+// ==========================================================
+
+app.get('/', (_, res) => {
+    res.json({ status: 'running' });
+});
+
+app.get('/health', (_, res) => {
+    res.json({ status: 'healthy' });
+});
+
+// ==========================================================
 // Single Prediction
+// ==========================================================
 app.post('/api/predict', upload.single('file'), async (req, res) => {
-    const requestId = req.id;
-    
+    if (!req.file) {
+        return res.status(400).json({ error: 'No file uploaded' });
+    }
+
     try {
-        if (!req.file) {
-            return res.status(400).json({
-                error: 'No file provided',
-                message: 'Please upload a DICOM or image file.'
-            });
-        }
-
-        logger.info(`Processing: ${req.file.originalname}`, { requestId });
-
         const formData = new FormData();
-        formData.append('file', req.file.buffer, {
-            filename: req.file.originalname,
-            contentType: req.file.mimetype || 'application/octet-stream'
-        });
+        formData.append('file', req.file.buffer, req.file.originalname);
 
-        const hfResponse = await makeHFRequest('/predict', formData, requestId);
+        const hfRes = await callHFSpace('/predict', formData, CONFIG.SINGLE_TIMEOUT_MS);
 
-        if (!hfResponse.ok) {
-            const errorText = await hfResponse.text();
-            logger.error(`HF error: ${hfResponse.status} - ${errorText}`, { requestId });
-            
-            if (hfResponse.status === 401 || hfResponse.status === 403) {
-                return res.status(503).json({
-                    error: 'Authentication failed',
-                    message: 'Service authentication error.'
-                });
-            }
-            
-            throw new Error(`HF returned ${hfResponse.status}`);
+        if (!hfRes.ok) {
+            return res.status(502).json({ error: `HF error ${hfRes.status}` });
         }
 
-        const result = await hfResponse.json();
-        
-        res.json({
-            ...result,
-            proxied: true,
-            proxy_request_id: requestId,
-            proxy_timestamp: new Date().toISOString()
-        });
+        const data = await hfRes.json();
+        res.json(data);
 
-    } catch (error) {
-        logger.error(`Error: ${error.message}`, { requestId, stack: error.stack });
-        res.status(500).json({
-            error: 'Analysis failed',
-            message: 'Unable to process image.',
-            requestId: requestId
-        });
+    } catch (err) {
+        logger.error(err);
+        res.status(500).json({ error: err.message });
     }
 });
 
+// ==========================================================
 // Batch Prediction
-app.post('/api/batch/predict', upload.array('files', 20), async (req, res) => {
-    const requestId = req.id;
-    
+// ==========================================================
+app.post('/api/batch/predict', upload.array('files'), async (req, res) => {
+    if (!req.files || req.files.length === 0) {
+        return res.status(400).json({ error: 'No files uploaded' });
+    }
+
     try {
-        if (!req.files || req.files.length === 0) {
-            return res.status(400).json({
-                error: 'No files provided',
-                message: 'Please upload at least one file.'
-            });
-        }
-
-        logger.info(`Batch processing: ${req.files.length} files`, { requestId });
-
         const formData = new FormData();
-        req.files.forEach(file => {
-            formData.append('files', file.buffer, {
-                filename: file.originalname,
-                contentType: file.mimetype || 'application/octet-stream'
-            });
-        });
 
-        const hfResponse = await makeHFRequest('/batch/predict', formData, requestId);
-
-        if (!hfResponse.ok) {
-            const errorText = await hfResponse.text();
-            logger.error(`HF batch error: ${hfResponse.status}`, { requestId });
-            
-            if (hfResponse.status === 401 || hfResponse.status === 403) {
-                return res.status(503).json({
-                    error: 'Authentication failed',
-                    message: 'Service authentication error.'
-                });
-            }
-            
-            throw new Error(`HF returned ${hfResponse.status}`);
+        for (const file of req.files) {
+            formData.append('files', file.buffer, file.originalname);
         }
 
-        const contentType = hfResponse.headers.get('content-type');
-        const contentDisposition = hfResponse.headers.get('content-disposition');
-        
-        res.setHeader('Content-Type', contentType || 'text/csv');
-        if (contentDisposition) {
-            res.setHeader('Content-Disposition', contentDisposition);
+        const hfRes = await callHFSpace('/batch/predict', formData, CONFIG.BATCH_TIMEOUT_MS);
+
+        if (!hfRes.ok) {
+            return res.status(502).json({ error: `HF error ${hfRes.status}` });
         }
-        res.setHeader('X-Proxy-Request-ID', requestId);
 
-        hfResponse.body.pipe(res);
+        const buffer = await hfRes.buffer();
 
-    } catch (error) {
-        logger.error(`Batch error: ${error.message}`, { requestId });
-        res.status(500).json({
-            error: 'Batch analysis failed',
-            message: 'Unable to process images.',
-            requestId: requestId
-        });
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', 'attachment; filename="results.csv"');
+
+        res.send(buffer);
+
+    } catch (err) {
+        logger.error(err);
+        res.status(500).json({ error: err.message });
     }
 });
 
-// Error Handling
+// ==========================================================
+// Error Handler
+// ==========================================================
 app.use((err, req, res, next) => {
-    logger.error('Error:', {
-        message: err.message,
-        requestId: req.id
-    });
-
-    if (err instanceof multer.MulterError) {
-        if (err.code === 'LIMIT_FILE_SIZE') {
-            return res.status(400).json({
-                error: 'File too large',
-                message: 'Maximum file size is 50MB.'
-            });
-        }
-    }
-
-    res.status(500).json({
-        error: 'Internal server error',
-        message: process.env.NODE_ENV === 'production' ? 'Something went wrong.' : err.message,
-        requestId: req.id
-    });
+    logger.error(err);
+    res.status(500).json({ error: 'Internal server error' });
 });
 
-// 404 Handler
-app.use((req, res) => {
-    res.status(404).json({
-        error: 'Not found',
-        message: `Endpoint ${req.method} ${req.path} does not exist.`
-    });
-});
-
-// Start Server
+// ==========================================================
+// START SERVER
+// ==========================================================
 app.listen(CONFIG.PORT, () => {
     logger.info(`🚀 Server running on port ${CONFIG.PORT}`);
-    logger.info(`📡 HF Space: ${CONFIG.HF_SPACE_URL}`);
-    logger.info(`🔐 Auth: ${CONFIG.HF_TOKEN ? 'HF Token OK' : 'Missing'}, ${CONFIG.API_KEY ? 'API Key OK' : 'Missing'}`);
+    logger.info(`HF URL: ${CONFIG.HF_SPACE_URL || 'NOT SET'}`);
 });
